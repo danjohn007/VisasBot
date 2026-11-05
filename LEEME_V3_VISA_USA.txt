@@ -1,0 +1,80 @@
+VISASBOT V3 - VISA AMERICANA PRIMERA VEZ / RENOVACIÓN
+===========================================================
+
+ARCHIVOS IMPORTANTES
+1) sql/04_perfilamiento_visa_usa_v3.sql
+   Ejecutar UNA VEZ en la base de datos antes de probar el nuevo flujo.
+
+2) sql/05_limpiar_pruebas_daniel.sql
+   Ejecutar cuando quieras borrar exclusivamente los registros de prueba
+   del chatbot asociados a:
+   - Daniel Mota
+   - Daniel Hernandez / Daniel Hernández
+   - 4428730578 / 5214428730578
+   - 4426133306 / 5214426133306
+
+   IMPORTANTE: el script NO elimina users, applications ni audit_trail,
+   porque "Daniel Mota" también existe como asesor/usuario del sistema.
+
+CAMBIOS DEL BOT
+- Flujo específico para 01_VISA_USA_PRIMERA_VEZ.
+- Flujo específico para 02_VISA_USA_RENOVACION.
+- Validación de número de solicitantes.
+- Validación de cantidad de edades.
+- Ocupación individual por solicitante.
+- Renovación: estatus, vencimiento y edad de otorgamiento por solicitante.
+- Oportunidad adicional de Pasaporte Mexicano sin reemplazar el interés de Visa.
+- Alertas a asesoría para casos especiales.
+- Origen del prospecto normalizado y consultable.
+- Nuevas tablas estructuradas:
+  bot_prospect_profiles
+  bot_profile_applicants
+- Se conserva bot_profile_answers para compatibilidad con la bandeja CRM actual.
+- No se muestran precios ni cotizaciones en el chatbot.
+- Al finalizar no se imprime un resumen de respuestas.
+- Se conserva la pausa total al pasar a WAITING_HUMAN.
+- Se conservan MENÚ / Menú principal / Regresar al menú / Inicio / Cambiar trámite.
+
+DESPLIEGUE
+- Primero ejecuta sql/04_perfilamiento_visa_usa_v3.sql.
+- Después despliega Functions como ya lo haces actualmente.
+- Luego, si quieres iniciar las pruebas desde cero, ejecuta
+  sql/05_limpiar_pruebas_daniel.sql.
+
+CAMBIO V3.1 - CIERRE COMERCIAL / MODO HÍBRIDO
+- Al terminar Primera Vez o Renovación se pregunta si desea iniciar el trámite
+  o consultar costos y formas de pago.
+- "Sí, quiero continuar":
+  * registra INTERES_CONTINUAR = SI;
+  * cambia automáticamente a HUMAN / WAITING_HUMAN;
+  * pausa por completo al bot;
+  * genera alerta de alta prioridad en CRM;
+  * confirma que una asesora continuará por el mismo chat.
+- "No por ahora":
+  * registra INTERES_CONTINUAR = NO;
+  * envía agradecimiento;
+  * cierra la conversación sin mostrar de nuevo el menú;
+  * cualquier mensaje posterior vuelve a abrir el menú automáticamente.
+- Si ya ejecutaste la migración V3 anterior, ejecuta:
+  sql/06_cierre_comercial_hibrido_v3_1.sql
+
+CAMBIO V3.2 - ASIGNACIÓN PERSISTENTE + PLANTILLA META
+- Al devolver una conversación al bot, assigned_agent_id y assigned_agent_name se conservan.
+- La asesora continúa viendo al cliente aunque el modo sea BOT.
+- Si el cliente vuelve a solicitar atención humana, regresa directamente a su asesora asignada.
+- La asesora puede retomar manualmente una conversación propia que esté en modo BOT.
+- El CRM puede enviar la plantilla aprobada:
+  seguimiento_tramite_visas / es_MX
+  {{1}} = nombre del cliente (automático)
+  {{2}} = mensaje de seguimiento escrito por la asesora
+- El envío de plantilla queda registrado en bot_messages y bot_conversation_events.
+- El administrador mantiene acceso a todas las conversaciones.
+
+CAMBIO V3.3 - OPTIMIZACIONES DE FLUJO
+- Primer contacto: solicita nombre y apellido antes de mostrar el menú.
+- El nombre declarado por el usuario sustituye el nombre de perfil de WhatsApp en el CRM.
+- Si requiere Pasaporte Mexicano adicional, se confirma que el interés quedó registrado y continúa la Visa sin reiniciar el flujo.
+- Después de confirmar interés comercial se pregunta si desea registrar otro trámite.
+- Si responde Sí, se abre el menú y los perfilamientos anteriores se conservan.
+- Si responde No, pasa a WAITING_HUMAN y se mantiene la lógica híbrida.
+- No requiere nuevas tablas ni migraciones para estos cambios.

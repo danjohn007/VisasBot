@@ -1,0 +1,11 @@
+VISASBOT V3.5 - RECONOCIMIENTO DE CLIENTES EXISTENTES
+
+- Nombre y apellido sólo se pide al primer contacto realmente nuevo.
+- Contactos creados antes de la captura de nombre no vuelven a pedirlo.
+- "Ya soy cliente" respeta vínculos previos del bot/CRM.
+- Busca solicitudes por client_user_id, application_id y teléfono en data_json.
+- Reconoce también perfilamientos históricos del propio bot.
+- Al regresar muestra trámites/perfilamientos existentes.
+- Opciones: Dar seguimiento / Otro trámite.
+- Otro trámite conserva completamente los registros anteriores.
+- No requiere migración SQL adicional.

@@ -1,0 +1,8 @@
+VISASBOT V3.4
+1) Ejecutar sql/07_round_robin_asesoras_v3_4.sql
+2) Desplegar Functions.
+
+Participan role='Asesor' e is_active=1.
+Orden: created_at ASC, id ASC.
+Rotación: 1 -> 2 -> ... -> N -> 1.
+La asignación ocurre desde el primer contacto y se conserva al volver al bot.

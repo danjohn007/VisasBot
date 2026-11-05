@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "tramite-visa-vaneza-boot",
+    "visasbot": "tramite-visa-vaneza-boot"
+  },
+  "targets": {},
+  "etags": {}
+}

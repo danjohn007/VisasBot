@@ -1,0 +1,9 @@
+VISASBOT V2
+- Bot de primer contacto con perfilamiento de 6 pasos para los servicios 1-9.
+- Handoff a asesora sin perder el servicio ni las respuestas capturadas.
+- El bot se pausa cuando la conversación pasa a atención humana.
+- Nueva Function crmWhatsAppVisasBot para tomar, responder, devolver al bot y cerrar.
+- Historial identifica CLIENTE / BOT / ASESORA / ADMIN.
+- Registro de intervenciones y eventos de atención.
+- Flujo "Ya soy cliente" consulta el trámite vinculado cuando es posible.
+- Migración SQL incluida en database/visasbot_v2_hybrid.sql.
