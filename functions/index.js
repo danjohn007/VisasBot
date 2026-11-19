@@ -97,6 +97,47 @@ function secureEqual(a, b) {
   return crypto.timingSafeEqual(left, right);
 }
 
+// Guarda la voz al recibirla; Meta no garantiza conservar archivos indefinidamente.
+// Se omite el error de medios sin bloquear la recepción del mensaje o el flujo humano.
+async function retrieveMetaAudio(token, mediaId) {
+  if (!/^\d{5,40}$/.test(String(mediaId || ""))) throw new Error("INVALID_MEDIA_ID");
+  const version = process.env.WHATSAPP_GRAPH_VERSION || "v25.0";
+  const auth = { Authorization: `Bearer ${token}` };
+  const metaResponse = await fetch(`https://graph.facebook.com/${version}/${mediaId}`, {
+    headers: auth, signal: AbortSignal.timeout(12000)
+  });
+  if (!metaResponse.ok) throw new Error("MEDIA_EXPIRED_OR_UNAVAILABLE");
+  const meta = await metaResponse.json();
+  const mime = String(meta.mime_type || "").toLowerCase();
+  if (!meta.url || !mime.startsWith("audio/")) throw new Error("UNSUPPORTED_MEDIA");
+  if (Number(meta.file_size || 0) > 8 * 1024 * 1024) throw new Error("MEDIA_TOO_LARGE");
+  const mediaUrl = new URL(meta.url);
+  if (mediaUrl.protocol !== "https:" || !/(^|\.)facebook\.com$|(^|\.)fbcdn\.net$/.test(mediaUrl.hostname)) {
+    throw new Error("UNEXPECTED_MEDIA_HOST");
+  }
+  const audioResponse = await fetch(mediaUrl, { headers: auth, signal: AbortSignal.timeout(18000) });
+  if (!audioResponse.ok) throw new Error("MEDIA_DOWNLOAD_FAILED");
+  const advertisedSize = Number(audioResponse.headers.get("content-length") || 0);
+  if (advertisedSize > 8 * 1024 * 1024) throw new Error("MEDIA_TOO_LARGE");
+  const bytes = Buffer.from(await audioResponse.arrayBuffer());
+  if (bytes.length > 8 * 1024 * 1024) throw new Error("MEDIA_TOO_LARGE");
+  return { mime_type: mime, bytes };
+}
+
+async function persistIncomingAudio(db, cfg, msg) {
+  if (msg?.type !== "audio" || !msg?.audio?.id || !msg?.id) return;
+  try {
+    const [rows] = await db.execute("SELECT id FROM bot_messages WHERE meta_message_id=? LIMIT 1", [msg.id]);
+    if (!rows.length) return;
+    const audio = await retrieveMetaAudio(cfg.WHATSAPP_TOKEN, msg.audio.id);
+    await db.execute(`INSERT INTO bot_audio_media (message_id, mime_type, audio_blob, created_at)
+      VALUES (?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE message_id = message_id`,
+      [rows[0].id, audio.mime_type, audio.bytes]);
+  } catch (e) {
+    logger.warn("INCOMING_AUDIO_ARCHIVE_FAILED", { messageId: msg.id, reason: e?.code || e?.message });
+  }
+}
+
 async function sendBootstrapFallback({ cfg, msg }) {
   const to = msg?.from;
   if (!to) return;
@@ -154,6 +195,8 @@ async function processIncomingMessage({ cfg, db, value, msg }) {
     await sendBootstrapFallback({ cfg, msg });
     return;
   }
+
+  if (msg?.type === "audio") await persistIncomingAudio(db, cfg, msg);
 
   const sendArgs = {
     pool: db,
@@ -363,6 +406,46 @@ export const crmWhatsAppVisasBot = onRequest(
     const db = getPool(cfg);
 
     try {
+      // V4.2: puente privado de medios. El CRM verifica permisos de lectura antes de llamar.
+      if (action === "get_audio") {
+        const messageId = Number(req.body?.messageId || 0);
+        if (!Number.isSafeInteger(messageId) || messageId <= 0) {
+          return res.status(400).json({ ok: false, error: "INVALID_MESSAGE_ID" });
+        }
+        const conversation = await getConversationById(db, conversationId);
+        if (!conversation) return res.status(404).json({ ok: false, error: "CONVERSATION_NOT_FOUND" });
+        if (actorRole === "Asesor" && (Number(conversation.assigned_agent_id) !== actorUserId ||
+            ["03_PASAPORTE_MEXICANO", "04_PASAPORTE_AMERICANO"].includes(conversation.service_code))) {
+          return res.status(403).json({ ok: false, error: "NOT_ASSIGNED" });
+        }
+        if (actorRole === "Gerente" && !["03_PASAPORTE_MEXICANO", "04_PASAPORTE_AMERICANO"].includes(conversation.service_code)) {
+          return res.status(403).json({ ok: false, error: "NOT_AUTHORIZED" });
+        }
+        const [rows] = await db.execute(
+          `SELECT payload_json, message_type FROM bot_messages
+           WHERE id = ? AND contact_id = ? AND direction = 'IN' LIMIT 1`,
+          [messageId, conversation.contact_id]
+        );
+        const row = rows[0];
+        if (!row || row.message_type !== "audio") return res.status(404).json({ ok: false, error: "AUDIO_NOT_FOUND" });
+        let payload;
+        try { payload = JSON.parse(row.payload_json || "{}"); } catch { payload = {}; }
+        const mediaId = String(payload.audio?.id || "");
+        if (!/^\d{5,40}$/.test(mediaId)) return res.status(404).json({ ok: false, error: "MEDIA_ID_NOT_SAVED" });
+        // Preferimos copia duradera en MySQL para no depender de la caducidad de Meta.
+        let cached = null;
+        try {
+          const [audioRows] = await db.execute(
+            "SELECT mime_type, audio_blob FROM bot_audio_media WHERE message_id=? LIMIT 1", [messageId]
+          );
+          if (audioRows.length) cached = { mime_type: audioRows[0].mime_type, bytes: audioRows[0].audio_blob };
+        } catch (e) {
+          if (e?.code !== "ER_NO_SUCH_TABLE") throw e;
+        }
+        const audio = cached || await retrieveMetaAudio(cfg.WHATSAPP_TOKEN, mediaId);
+        return res.json({ ok: true, mime_type: audio.mime_type, base64: audio.bytes.toString("base64") });
+      }
+
       if (action === "take") {
         const conversation = await takeConversation(db, { conversationId, actorUserId, actorName, actorRole });
         return res.json({ ok: true, conversation });
