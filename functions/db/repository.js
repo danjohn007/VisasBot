@@ -1,5 +1,50 @@
 import { last10Digits, normalizePhone } from "../utils/normalizeText.js";
 
+const GERENCIA_PASSPORT_SERVICES = new Set([
+  "03_PASAPORTE_MEXICANO",
+  "04_PASAPORTE_AMERICANO",
+]);
+
+export function isGerenciaPassportService(serviceCode) {
+  return GERENCIA_PASSPORT_SERVICES.has(String(serviceCode || "").trim());
+}
+
+async function selectActiveManager(conn) {
+  // Fuente de verdad: configuración explícita del responsable de pasaportes.
+  // Si la configuración aún no existe, se usa un fallback controlado a Rosy/Rosa
+  // y finalmente a la primera Gerente activa. Nunca se enruta un pasaporte a Asesor.
+  try {
+    const [configured] = await conn.execute(
+      `SELECT u.id, u.full_name, u.created_at
+         FROM global_config gc
+         JOIN users u ON u.id = CAST(gc.config_value AS UNSIGNED)
+        WHERE gc.config_key = 'passport_manager_user_id'
+          AND u.role = 'Gerente'
+          AND u.is_active = 1
+        LIMIT 1`
+    );
+    if (configured[0]) return configured[0];
+  } catch (error) {
+    if (!['ER_NO_SUCH_TABLE', 'ER_BAD_FIELD_ERROR'].includes(error?.code)) throw error;
+  }
+
+  const [rows] = await conn.execute(
+    `SELECT id, full_name, created_at
+       FROM users
+      WHERE role = 'Gerente'
+        AND is_active = 1
+      ORDER BY
+        CASE
+          WHEN LOWER(full_name) LIKE 'rosa%' OR LOWER(full_name) LIKE '%rosy%'
+            OR LOWER(username) LIKE 'rose%' OR LOWER(username) LIKE 'rosy%'
+          THEN 0 ELSE 1
+        END,
+        id ASC
+      LIMIT 1`
+  );
+  return rows[0] || null;
+}
+
 export async function ensureCatalogSeed(pool) {
   const services = [
     ["01_VISA_USA_PRIMERA_VEZ", "Visa Americana - Primera vez", "VISA_USA_PRIMERA_VEZ", 1],
@@ -126,7 +171,7 @@ export async function ensureAutomaticConversationAssignment(pool, contactId) {
     await conn.beginTransaction();
 
     const [rows] = await conn.execute(
-      `SELECT id, assigned_agent_id, assigned_agent_name, mode, status
+      `SELECT id, service_code, assigned_agent_id, assigned_agent_name, mode, status
          FROM bot_conversations
         WHERE contact_id = ?
         LIMIT 1
@@ -140,23 +185,76 @@ export async function ensureAutomaticConversationAssignment(pool, contactId) {
       return null;
     }
 
-    if (conversation.assigned_agent_id) {
-      await conn.commit();
-      return {
-        conversationId: conversation.id,
-        assignedAgentId: Number(conversation.assigned_agent_id),
-        assignedAgentName: conversation.assigned_agent_name,
-        existing: true,
-      };
-    }
+    const serviceCode = String(conversation.service_code || '').trim();
 
-    const advisor = await selectNextRoundRobinAdvisor(conn);
-    if (!advisor) {
+    // Regla estructural: antes de elegir servicio no existe responsable.
+    // Esto evita que el round-robin se ejecute prematuramente y contamine
+    // la posterior selección de Pasaporte -> Gerencia.
+    if (!serviceCode) {
+      if (conversation.mode === 'BOT' && conversation.status === 'OPEN' && conversation.assigned_agent_id) {
+        await conn.execute(
+          `UPDATE bot_conversations
+              SET assigned_agent_id = NULL,
+                  assigned_agent_name = NULL,
+                  updated_at = NOW()
+            WHERE id = ?`,
+          [conversation.id]
+        );
+      }
       await conn.commit();
       return null;
     }
 
-    autoActivatedHuman = conversation.status === "WAITING_HUMAN";
+    const routeToManager = isGerenciaPassportService(serviceCode);
+    const passportManager = routeToManager ? await selectActiveManager(conn) : null;
+
+    // Sólo conservamos una asignación existente si sigue activa y corresponde
+    // exactamente al responsable correcto. En Pasaportes no basta ser Gerente:
+    // debe ser la Gerente configurada (Rosy).
+    if (conversation.assigned_agent_id) {
+      const [assignedRows] = await conn.execute(
+        `SELECT id, full_name, role
+           FROM users
+          WHERE id = ? AND is_active = 1
+          LIMIT 1`,
+        [conversation.assigned_agent_id]
+      );
+      const assigned = assignedRows[0] || null;
+      const isCorrect = routeToManager
+        ? Boolean(assigned && passportManager && Number(assigned.id) === Number(passportManager.id))
+        : Boolean(assigned && assigned.role === 'Asesor');
+      if (isCorrect) {
+        await conn.commit();
+        return {
+          conversationId: conversation.id,
+          assignedAgentId: Number(assigned.id),
+          assignedAgentName: assigned.full_name,
+          serviceCode,
+          existing: true,
+        };
+      }
+    }
+
+    const responsible = routeToManager
+      ? passportManager
+      : await selectNextRoundRobinAdvisor(conn);
+
+    // Pasaporte jamás cae al round-robin. Si no hay Gerente activa se deja
+    // sin responsable para que el problema sea visible y no se asigne mal.
+    if (!responsible) {
+      await conn.execute(
+        `UPDATE bot_conversations
+            SET assigned_agent_id = NULL,
+                assigned_agent_name = NULL,
+                updated_at = NOW()
+          WHERE id = ?`,
+        [conversation.id]
+      );
+      await conn.commit();
+      return null;
+    }
+
+    autoActivatedHuman = conversation.status === 'WAITING_HUMAN';
 
     await conn.execute(
       `UPDATE bot_conversations
@@ -167,15 +265,16 @@ export async function ensureAutomaticConversationAssignment(pool, contactId) {
               handoff_taken_at = IF(status = 'WAITING_HUMAN', COALESCE(handoff_taken_at, NOW()), handoff_taken_at),
               updated_at = NOW()
         WHERE id = ?`,
-      [advisor.id, advisor.full_name, conversation.id]
+      [responsible.id, responsible.full_name, conversation.id]
     );
 
     await conn.commit();
 
     assignment = {
       conversationId: conversation.id,
-      assignedAgentId: Number(advisor.id),
-      assignedAgentName: advisor.full_name,
+      assignedAgentId: Number(responsible.id),
+      assignedAgentName: responsible.full_name,
+      serviceCode,
       existing: false,
     };
   } catch (error) {
@@ -186,16 +285,19 @@ export async function ensureAutomaticConversationAssignment(pool, contactId) {
   }
 
   if (assignment?.conversationId) {
+    const passportRoute = isGerenciaPassportService(assignment.serviceCode);
     await addConversationEvent(pool, {
       conversationId: assignment.conversationId,
-      eventType: "AUTO_ASSIGNED",
-      actorName: "Sistema",
-      actorRole: "Sistema",
-      detail: `Cliente asignado automáticamente a ${assignment.assignedAgentName} mediante rotación de asesoras.`,
+      eventType: 'AUTO_ASSIGNED',
+      actorName: 'Sistema',
+      actorRole: 'Sistema',
+      detail: passportRoute
+        ? `Pasaporte asignado automáticamente a Gerencia: ${assignment.assignedAgentName}.`
+        : `Cliente asignado automáticamente a ${assignment.assignedAgentName} mediante rotación de asesoras.`,
       metadata: {
         assigned_agent_id: assignment.assignedAgentId,
         assigned_agent_name: assignment.assignedAgentName,
-        strategy: "ROUND_ROBIN",
+        strategy: passportRoute ? 'GERENCIA_PASAPORTES' : 'ROUND_ROBIN',
         human_mode_activated: autoActivatedHuman,
       },
     });
@@ -281,21 +383,111 @@ function withMeta(payload, meta) {
 }
 
 export async function saveInboundMessage(pool, { contactId, conversationId = null, metaMessageId, messageType, text, payload }) {
-  const loggedPayload = withMeta(payload, { sender_type: "USER", conversation_id: conversationId });
+  const loggedPayload = withMeta(payload, { sender_type: 'USER', conversation_id: conversationId });
   const [result] = await pool.execute(
     `INSERT IGNORE INTO bot_messages
       (contact_id, meta_message_id, direction, message_type, message_text, payload_json, created_at)
      VALUES (?, ?, 'IN', ?, ?, ?, NOW())`,
     [contactId, metaMessageId, messageType, text || null, JSON.stringify(loggedPayload)]
   );
+
   if (result.affectedRows === 1 && conversationId) {
-    await pool.execute(
-      `UPDATE bot_conversations
-          SET last_message_at = NOW(), last_customer_message_at = NOW(), updated_at = NOW()
-        WHERE id = ?`,
-      [conversationId]
-    );
+    const conn = await pool.getConnection();
+    let reactivatedConversation = false;
+    let reactivatedApplicationIds = [];
+
+    try {
+      await conn.beginTransaction();
+
+      const [conversationRows] = await conn.execute(
+        `SELECT followup_state
+           FROM bot_conversations
+          WHERE id = ?
+          LIMIT 1
+          FOR UPDATE`,
+        [conversationId]
+      );
+      reactivatedConversation = String(conversationRows[0]?.followup_state || 'ACTIVO') === 'NO_RESPONDIO';
+
+      await conn.execute(
+        `UPDATE bot_conversations
+            SET last_message_at = NOW(),
+                last_customer_message_at = NOW(),
+                followup_state = 'ACTIVO',
+                followup_paused_at = NULL,
+                followup_paused_by = NULL,
+                followup_pause_reason = NULL,
+                updated_at = NOW()
+          WHERE id = ?`,
+        [conversationId]
+      );
+
+      const [linkedApps] = await conn.execute(
+        `SELECT DISTINCT a.id
+           FROM applications a
+           JOIN bot_application_links bal ON bal.application_id = a.id
+          WHERE bal.conversation_id = ?
+            AND a.followup_state = 'NO_RESPONDIO'
+          FOR UPDATE`,
+        [conversationId]
+      );
+      reactivatedApplicationIds = linkedApps.map((row) => Number(row.id));
+
+      if (reactivatedApplicationIds.length) {
+        await conn.execute(
+          `UPDATE applications a
+           JOIN bot_application_links bal ON bal.application_id = a.id
+              SET a.followup_state = 'ACTIVO',
+                  a.followup_paused_at = NULL,
+                  a.followup_paused_by = NULL,
+                  a.followup_pause_reason = NULL,
+                  a.updated_at = NOW()
+            WHERE bal.conversation_id = ?
+              AND a.followup_state = 'NO_RESPONDIO'`,
+          [conversationId]
+        );
+      }
+
+      if (reactivatedConversation) {
+        await conn.execute(
+          `INSERT INTO followup_events
+            (source_type, source_id, previous_state, new_state, reason, changed_by, changed_by_name, created_at)
+           VALUES ('CONVERSATION', ?, 'NO_RESPONDIO', 'ACTIVO',
+                   'Reactivado automáticamente al recibir una nueva respuesta del cliente.', NULL, 'Bot WhatsApp', NOW())`,
+          [conversationId]
+        );
+      }
+
+      for (const applicationId of reactivatedApplicationIds) {
+        await conn.execute(
+          `INSERT INTO followup_events
+            (source_type, source_id, previous_state, new_state, reason, changed_by, changed_by_name, created_at)
+           VALUES ('APPLICATION', ?, 'NO_RESPONDIO', 'ACTIVO',
+                   'Reactivado automáticamente al recibir una nueva respuesta del cliente por WhatsApp.', NULL, 'Bot WhatsApp', NOW())`,
+          [applicationId]
+        );
+      }
+
+      await conn.commit();
+    } catch (error) {
+      try { await conn.rollback(); } catch {}
+      throw error;
+    } finally {
+      conn.release();
+    }
+
+    if (reactivatedConversation) {
+      await addConversationEvent(pool, {
+        conversationId,
+        eventType: 'FOLLOWUP_REACTIVATED',
+        actorName: 'Bot WhatsApp',
+        actorRole: 'Sistema',
+        detail: 'El seguimiento se reactivó automáticamente porque el cliente volvió a responder.',
+        metadata: { automatic: true, application_ids: reactivatedApplicationIds },
+      });
+    }
   }
+
   return result.affectedRows === 1;
 }
 
@@ -382,20 +574,26 @@ export async function resetToMainMenu(pool, contactId) {
 }
 
 export async function selectService(pool, { contactId, service }) {
-  const state = service.code === "10_CLIENTE_SEGUIMIENTO" ? "CLIENTE_SEGUIMIENTO" : "PENDIENTE_FLUJO";
-  const contactType = service.code === "10_CLIENTE_SEGUIMIENTO" ? "CLIENTE_SEGUIMIENTO" : "PROSPECTO";
-  const leadStatus = service.code === "10_CLIENTE_SEGUIMIENTO" ? "SEGUIMIENTO_SOLICITADO" : "SERVICIO_SELECCIONADO";
+  const state = service.code === '10_CLIENTE_SEGUIMIENTO' ? 'CLIENTE_SEGUIMIENTO' : 'PENDIENTE_FLUJO';
+  const contactType = service.code === '10_CLIENTE_SEGUIMIENTO' ? 'CLIENTE_SEGUIMIENTO' : 'PROSPECTO';
+  const leadStatus = service.code === '10_CLIENTE_SEGUIMIENTO' ? 'SEGUIMIENTO_SOLICITADO' : 'SERVICIO_SELECCIONADO';
 
   const conn = await pool.getConnection();
+  let assigned = null;
+  let assignmentStrategy = null;
+
   try {
     await conn.beginTransaction();
+
     const [contactResult] = await conn.execute(
       `UPDATE bot_contacts
           SET service_code = ?, contact_type = ?, lead_status = ?, last_contact_at = NOW(), updated_at = NOW()
         WHERE id = ?`,
       [service.code, contactType, leadStatus, contactId]
     );
-    if (contactResult.affectedRows !== 1) throw Object.assign(new Error(`bot_contacts.id=${contactId} no encontrado.`), { code: "BOT_CONTACT_NOT_FOUND" });
+    if (contactResult.affectedRows !== 1) {
+      throw Object.assign(new Error(`bot_contacts.id=${contactId} no encontrado.`), { code: 'BOT_CONTACT_NOT_FOUND' });
+    }
 
     const [sessionResult] = await conn.execute(
       `UPDATE bot_sessions
@@ -403,24 +601,100 @@ export async function selectService(pool, { contactId, service }) {
         WHERE contact_id = ?`,
       [state, service.flowKey, service.code, contactId]
     );
-    if (sessionResult.affectedRows !== 1) throw Object.assign(new Error(`bot_sessions.contact_id=${contactId} no encontrado.`), { code: "BOT_SESSION_NOT_FOUND" });
+    if (sessionResult.affectedRows !== 1) {
+      throw Object.assign(new Error(`bot_sessions.contact_id=${contactId} no encontrado.`), { code: 'BOT_SESSION_NOT_FOUND' });
+    }
+
+    const [conversationRows] = await conn.execute(
+      `SELECT id, assigned_agent_id
+         FROM bot_conversations
+        WHERE contact_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [contactId]
+    );
+    const conversation = conversationRows[0] || null;
+    if (!conversation) {
+      throw Object.assign(new Error(`bot_conversations.contact_id=${contactId} no encontrado.`), { code: 'BOT_CONVERSATION_NOT_FOUND' });
+    }
+
+    if (isGerenciaPassportService(service.code)) {
+      // Regla absoluta: ambos pasaportes pertenecen a Gerencia/Rosy.
+      assigned = await selectActiveManager(conn);
+      assignmentStrategy = 'GERENCIA_PASAPORTES';
+    } else {
+      // Para servicios no-Pasaporte conservamos al Asesor sólo si sigue activo.
+      if (conversation.assigned_agent_id) {
+        const [existingRows] = await conn.execute(
+          `SELECT id, full_name
+             FROM users
+            WHERE id = ? AND role = 'Asesor' AND is_active = 1
+            LIMIT 1`,
+          [conversation.assigned_agent_id]
+        );
+        assigned = existingRows[0] || null;
+      }
+      if (!assigned) assigned = await selectNextRoundRobinAdvisor(conn);
+      assignmentStrategy = 'ROUND_ROBIN';
+    }
 
     await conn.execute(
       `UPDATE bot_conversations
-          SET service_code = ?, mode = 'BOT', status = 'OPEN',
-              handoff_reason = NULL, handoff_requested_at = NULL,
-              bot_resume_state = ?, closed_at = NULL, updated_at = NOW()
+          SET service_code = ?,
+              mode = 'BOT',
+              status = 'OPEN',
+              assigned_agent_id = ?,
+              assigned_agent_name = ?,
+              handoff_reason = NULL,
+              handoff_requested_at = NULL,
+              handoff_taken_at = NULL,
+              bot_resume_state = ?,
+              closed_at = NULL,
+              updated_at = NOW()
         WHERE contact_id = ?`,
-      [service.code, state, contactId]
+      [service.code, assigned?.id || null, assigned?.full_name || null, state, contactId]
     );
+
     await conn.commit();
-    return { state, contactType, leadStatus, humanHandoff: 0 };
   } catch (error) {
     try { await conn.rollback(); } catch {}
     throw error;
   } finally {
     conn.release();
   }
+
+  if (assigned) {
+    const [convRows] = await pool.execute(
+      `SELECT id FROM bot_conversations WHERE contact_id = ? LIMIT 1`,
+      [contactId]
+    );
+    if (convRows[0]?.id) {
+      await addConversationEvent(pool, {
+        conversationId: convRows[0].id,
+        eventType: 'AUTO_ASSIGNED',
+        actorName: 'Sistema',
+        actorRole: 'Sistema',
+        detail: isGerenciaPassportService(service.code)
+          ? `Pasaporte dirigido automáticamente a Gerencia: ${assigned.full_name}.`
+          : `Servicio dirigido automáticamente a ${assigned.full_name}.`,
+        metadata: {
+          service_code: service.code,
+          assigned_agent_id: Number(assigned.id),
+          assigned_agent_name: assigned.full_name,
+          strategy: assignmentStrategy,
+        },
+      });
+    }
+  }
+
+  return {
+    state,
+    contactType,
+    leadStatus,
+    humanHandoff: 0,
+    assignedAgentId: assigned ? Number(assigned.id) : null,
+    assignedAgentName: assigned?.full_name || null,
+  };
 }
 
 export async function setSessionState(pool, contactId, state) {
@@ -810,6 +1084,7 @@ export async function takeConversation(pool, { conversationId, actorUserId, acto
         WHERE id = ?`,
       [targetAgentId, targetAgentName, conversationId]
     );
+    await conn.execute(`UPDATE bot_sessions SET human_handoff = 1, updated_at = NOW() WHERE contact_id = ?`, [conversation.contact_id]);
     await conn.commit();
     await addConversationEvent(pool, {
       conversationId,

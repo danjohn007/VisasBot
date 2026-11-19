@@ -1,11 +1,11 @@
 import { SERVICE_BY_CODE } from "../config/services.js";
 import { detectServiceFromText, isAdvisorRequest, isGreetingOrInfoRequest, isMenuCommand } from "../utils/intent.js";
 
-export function resolveAction({ parsed, session, contact }) {
+export function resolveAction({ parsed, session, contact, conversation }) {
   const state = session?.state || "MENU_PRINCIPAL";
 
   // Mientras una asesora atiende la conversación el bot permanece totalmente en pausa.
-  if (Number(session?.human_handoff || 0) === 1 || state === "ASESOR_SOLICITADO") {
+  if (conversation?.mode === "HUMAN" || Number(session?.human_handoff || 0) === 1 || state === "ASESOR_SOLICITADO") {
     return { type: "NO_AUTO_REPLY", reason: "human_handoff" };
   }
 

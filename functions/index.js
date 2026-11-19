@@ -164,7 +164,7 @@ async function processIncomingMessage({ cfg, db, value, msg }) {
     phoneNumberId: cfg.WHATSAPP_PHONE_NUMBER_ID,
   };
   const ctx = { cfg, pool: db, contact, session, conversation, parsed, sendArgs };
-  const action = resolveAction({ parsed, session, contact });
+  const action = resolveAction({ parsed, session, contact, conversation });
 
   logger.info("FLOW_ROUTE", {
     messageId: msg?.id,
@@ -356,7 +356,7 @@ export const crmWhatsAppVisasBot = onRequest(
     const actorName = String(req.body?.actorName || "Usuario CRM").slice(0, 100);
     const actorRole = String(req.body?.actorRole || "").slice(0, 50);
 
-    if (!conversationId || !actorUserId || !["Administrador", "Asesor"].includes(actorRole)) {
+    if (!conversationId || !actorUserId || !["Administrador", "Asesor", "Gerente"].includes(actorRole)) {
       return res.status(400).json({ ok: false, error: "INVALID_ACTOR_OR_CONVERSATION" });
     }
 
